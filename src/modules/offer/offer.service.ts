@@ -46,10 +46,11 @@ export class OfferService {
     return created;
   }
 
-  list(p: PaginationDto, q: OfferFilter): Promise<OfferWithRelations[]> {
+  list(p: PaginationDto, q: OfferFilter) {
     const where: Record<string, unknown> = {};
     if (q.creatorId) where.creatorId = q.creatorId;
     if (q.status) where.status = q.status;
+    if (q.status === 'active' && !q.creatorId) where.executed = false;
     if (q.type) where.type = q.type;
     if (q.assetCode) where.assetCode = q.assetCode;
     if (q.minPrice !== undefined || q.maxPrice !== undefined) {
@@ -66,7 +67,13 @@ export class OfferService {
     }
     const sortBy = q.sortBy === 'price' || q.sortBy === 'createdAt' ? q.sortBy : 'offerId';
     const sortOrder = q.sortOrder === 'asc' ? 'asc' : 'desc';
-    return this.repo.search(where, p.skip, p.take, sortBy, sortOrder);
+    return this.repo.searchPage(
+      where,
+      p.skip ?? 0,
+      p.take ?? 20,
+      sortBy,
+      sortOrder,
+    );
   }
 
   async get(id: string): Promise<OfferWithRelations> {

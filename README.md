@@ -18,6 +18,8 @@ LocalSettle is a peer-to-peer marketplace that connects local payment methods wi
 
 `POST /auth/challenge` creates a short-lived random challenge for a public key. The connected wallet signs it locally. `POST /auth/login` verifies the signature, consumes the challenge once, and returns a session token. The API verifies public-key ownership; it does not need the user's secret key for this flow.
 
+The login token is temporary and can be used to validate an alias and complete `POST /users/:id/setup`. That bootstrap route remains available before setup is complete. The setup response returns a final token with the `setupComplete: true` claim; profile, payment, trading, chat, and wallet routes that declare `SetupCompleteGuard` require that final token.
+
 ### Direct USDC payment
 
 The authenticated client calls `GET /send/resolve` for a Stellar address or LocalSettle alias, then `POST /send/prepare`. The API reads recipient account information, builds an unsigned Stellar transaction XDR, and returns it for review. The client asks the user's wallet to sign. `POST /send/submit` broadcasts the signed XDR through Horizon and returns the transaction result.
@@ -76,14 +78,16 @@ Protocol references: [Stellar developer documentation](https://developers.stella
 
 ## Run locally
 
-Requirements: Node.js 20+, npm, and PostgreSQL. Copy `.env.example` to `.env`; configure `DATABASE_URL`, `DIRECT_URL`, and a local `JWT_SECRET`. For Stellar features, configure `STELLAR_HORIZON_URL`, `STELLAR_RPC_URL`, `STELLAR_NETWORK`, and the relevant issuer and Trustless Work values. Use test credentials and Testnet accounts only.
+Requirements: Node.js 22 (see `.nvmrc`), pnpm 11.13.0 (pinned in `package.json`), and PostgreSQL. Copy `.env.example` to `.env`; configure `DATABASE_URL`, `DIRECT_URL`, and a local `JWT_SECRET`. For Stellar features, configure `STELLAR_HORIZON_URL`, `STELLAR_RPC_URL`, `STELLAR_NETWORK`, and the relevant issuer and Trustless Work values. Use test credentials and Testnet accounts only.
 
 ```bash
-npm install
+pnpm install --frozen-lockfile
 npx prisma generate
 npx prisma migrate dev
-npm run start:dev
+pnpm run start:dev
 ```
+
+For production, commit the generated migration directory and run `pnpm exec prisma migrate deploy` as a release step. Keep `DATABASE_URL` pointed at the runtime pool and `DIRECT_URL` at the direct database connection. CI runs `prisma validate` using placeholder URLs and does not connect to a database.
 
 The API listens on port `3001` by default. The frontend should point `NEXT_PUBLIC_API_URL` at `http://localhost:3001`. Never commit real secrets. The existing `IKASH_*` escrow environment variable names are retained for deployment compatibility; see `.env.example` before configuring them.
 
@@ -99,14 +103,16 @@ The API listens on port `3001` by default. The frontend should point `NEXT_PUBLI
 
 Routes have endpoint-specific validation and guards. Check the controller and DTO before relying on an endpoint's authentication or ownership behavior.
 
+Sensitive profile changes are recorded as `USER_PROFILE_UPDATED` audit events. Their metadata contains only changed field names (or requested field names on failure); submitted values are never copied into audit metadata. No-op requests are recorded with an empty field list. Profile-image updates use the same event with `profileImageUrl` as the sole field name.
+
 ## Development checks
 
 ```bash
-npm run build       # Compile the NestJS application
-npm test            # Run Jest unit tests
-npm run test:e2e    # Run API and gateway end-to-end tests
-npm run test:cov    # Collect Jest coverage
-npm run format      # Format TypeScript source and tests
+pnpm run build       # Compile the NestJS application
+pnpm test            # Run Jest unit tests
+pnpm run test:e2e    # Run API and gateway end-to-end tests
+pnpm run test:cov    # Collect Jest coverage
+pnpm run format      # Format TypeScript source and tests
 ```
 
 Unit tests use Jest `*.spec.ts` files near the implementation. Add regression coverage for authentication, transaction preparation, escrow transitions, access control, and event processing when changing those areas.
@@ -122,3 +128,5 @@ Never commit or log private keys, JWTs, webhook secrets, full bank details, or i
 ## License
 
 LocalSettle is licensed under the MIT License. See [LICENSE](LICENSE).
+
+`GET /stellar/balances/:publicKey` returns each asset balance as before. The native XLM record also includes `minimum_reserve` and `spendable_balance`; reserve uses the live Horizon base reserve and account subentry/sponsorship counts, and spendable subtracts selling liabilities.

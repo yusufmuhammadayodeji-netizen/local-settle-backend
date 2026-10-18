@@ -12,6 +12,7 @@ model AppUser {
   userId               String           @id @default(dbgenerated("gen_random_uuid()")) @map("user_id") @db.Uuid
   publicKey            String           @unique @map("public_key")
   alias                String?          @unique @map("alias")
+  aliasNormalized      String?          @unique @map("alias_normalized")
   username             String?          @map("username")
   kycStatus            kyc_status       @default(pending) @map("kyc_status")
   role                 app_role         @default(user) @map("role")
@@ -52,6 +53,8 @@ model Offer {
   orders          Order[]
   payment_methods PaymentMethod[] @relation("OfferPaymentMethods")
 
+  @@index([status, type, assetCode, offerId], map: "idx_offer_market_filters")
+  @@index([creatorId, offerId], map: "idx_offer_creator_offer_id")
   @@map("offer")
 }
 
@@ -70,6 +73,9 @@ model Order {
   offer        Offer          @relation(fields: [offerId], references: [offerId], onUpdate: NoAction)
   seller       AppUser        @relation("SellerOrders", fields: [sellerId], references: [userId], onUpdate: NoAction)
 
+  @@index([buyerId, orderStatus, orderId], map: "idx_order_buyer_status_order_id")
+  @@index([sellerId, orderStatus, orderId], map: "idx_order_seller_status_order_id")
+  @@index([offerId, orderId], map: "idx_order_offer_order_id")
   @@map("order")
 }
 
@@ -93,10 +99,13 @@ model ChatMessage {
   messageId String   @id @default(dbgenerated("gen_random_uuid()")) @map("message_id") @db.Uuid
   orderId   String   @map("order_id") @db.Uuid
   senderId  String   @map("sender_id") @db.Uuid
+  clientMessageId String? @map("client_message_id") @db.Uuid
   content   String
   timestamp DateTime @default(now()) @db.Timestamptz(6)
   order     Order    @relation(fields: [orderId], references: [orderId], onDelete: Cascade, onUpdate: NoAction)
   sender    AppUser  @relation(fields: [senderId], references: [userId], onUpdate: NoAction)
+
+  @@unique([orderId, senderId, clientMessageId])
 
   @@map("chatmessage")
 }

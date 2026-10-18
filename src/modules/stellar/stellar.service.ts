@@ -9,11 +9,13 @@ import {
   Memo,
   Networks,
   Operation,
+  StrKey,
   Transaction,
   TransactionBuilder,
 } from '@stellar/stellar-sdk';
 import { AppException, ErrorCode } from '../../common/errors';
 import { describeHorizonError } from '../../lib/utils/stellar-error.util';
+import { ProviderRequestQueue } from '../../common/provider-request-queue';
 
 type NetworkType = 'testnet' | 'public';
 
@@ -23,6 +25,8 @@ export interface BalanceRecord {
   asset_issuer: string | null;
   balance: string;
   limit: string | null;
+  minimum_reserve?: string;
+  spendable_balance?: string;
 }
 
 export interface TransactionRecord {
@@ -74,6 +78,7 @@ interface OperationFields {
 @Injectable()
 export class StellarService {
   private readonly server: Horizon.Server;
+  private readonly horizonQueue: ProviderRequestQueue;
   private readonly networkPassphrase: string;
   private readonly signerSecret?: string;
 
@@ -91,15 +96,30 @@ export class StellarService {
     this.signerSecret = this.config.get<string>('STELLAR_SIGNER_SECRET');
 
     this.server = new Horizon.Server(horizonUrl);
+    this.horizonQueue = new ProviderRequestQueue(
+      Number(this.config.get<string>('STELLAR_MAX_CONCURRENT_REQUESTS') ?? 5),
+      Number(this.config.get<string>('STELLAR_MAX_QUEUED_REQUESTS') ?? 25),
+      Number(this.config.get<string>('STELLAR_QUEUE_TIMEOUT_MS') ?? 10_000),
+    );
+  }
+
+  private horizonRequest<T>(request: () => Promise<T>): Promise<T> {
+    return this.horizonQueue.run(request);
   }
 
   async getAccount(publicKey: string): Promise<Horizon.AccountResponse> {
     this.assertPublicKey(publicKey);
-    return this.server.loadAccount(publicKey);
+    return this.horizonRequest(() => this.server.loadAccount(publicKey));
   }
 
   async getBalances(publicKey: string): Promise<BalanceRecord[]> {
     const account = await this.getAccount(publicKey);
+    const root = await this.server.root().call();
+    const baseReserve = Number(root.base_reserve_in_stroops) / 10_000_000;
+    const subentryCount = Number(account.subentry_count ?? 0);
+    const sponsoring = Number(account.num_sponsoring ?? 0);
+    const sponsored = Number(account.num_sponsored ?? 0);
+    const minimumReserve = Math.max(0, 2 + subentryCount + sponsoring - sponsored) * baseReserve;
 
     return account.balances.map((b): BalanceRecord => {
       const record: BalanceRecord = {
@@ -109,6 +129,16 @@ export class StellarService {
         balance: b.balance,
         limit: 'limit' in b ? (b.limit ?? null) : null,
       };
+      if (b.asset_type === 'native') {
+        const sellingLiabilities = Number(
+          'selling_liabilities' in b ? b.selling_liabilities ?? 0 : 0,
+        );
+        record.minimum_reserve = minimumReserve.toFixed(7);
+        record.spendable_balance = Math.max(
+          0,
+          Number(b.balance) - sellingLiabilities - minimumReserve,
+        ).toFixed(7);
+      }
       return record;
     });
   }
@@ -120,12 +150,14 @@ export class StellarService {
     this.assertPublicKey(publicKey);
 
     try {
-      const res = await this.server
-        .payments()
-        .forAccount(publicKey)
-        .order('desc')
-        .limit(Math.min(Math.max(limit, 1), 200))
-        .call();
+      const res = await this.horizonRequest(() =>
+        this.server
+          .payments()
+          .forAccount(publicKey)
+          .order('desc')
+          .limit(Math.min(Math.max(limit, 1), 200))
+          .call(),
+      );
 
       return res.records.map((op): TransactionRecord => {
         const o = op as unknown as OperationFields;
@@ -181,7 +213,7 @@ export class StellarService {
     const sourceKeypair = Keypair.fromSecret(this.signerSecret);
     const sourcePublicKey = sourceKeypair.publicKey();
 
-    const account = await this.server.loadAccount(sourcePublicKey);
+    const account = await this.horizonRequest(() => this.server.loadAccount(sourcePublicKey));
     const asset = this.buildAsset(params.asset);
 
     let builder = new TransactionBuilder(account, {
@@ -202,7 +234,7 @@ export class StellarService {
     const tx = builder.setTimeout(60).build();
     tx.sign(sourceKeypair);
     const res: Horizon.HorizonApi.SubmitTransactionResponse =
-      await this.server.submitTransaction(tx);
+      await this.horizonRequest(() => this.server.submitTransaction(tx));
 
     return {
       hash: res.hash,
@@ -229,7 +261,7 @@ export class StellarService {
     this.assertAmount(params.feeAmount);
 
     const usdc = this.getUsdcAsset();
-    const account = await this.server.loadAccount(params.sourcePublicKey);
+    const account = await this.horizonRequest(() => this.server.loadAccount(params.sourcePublicKey));
 
     const tx = new TransactionBuilder(account, {
       fee: String(BASE_FEE),
@@ -275,7 +307,7 @@ export class StellarService {
 
     try {
       const res: Horizon.HorizonApi.SubmitTransactionResponse =
-        await this.server.submitTransaction(tx);
+        await this.horizonRequest(() => this.server.submitTransaction(tx));
       return {
         hash: res.hash,
         ledger: res.ledger,
@@ -318,10 +350,10 @@ export class StellarService {
   }
 
   private assertPublicKey(key: string): void {
-    if (!key || key[0] !== 'G' || key.length < 50) {
+    if (!StrKey.isValidEd25519PublicKey(key)) {
       throw new AppException(
         ErrorCode.INVALID_STELLAR_ADDRESS,
-        'Invalid public key. Must start with "G" and be at least 50 characters.',
+        'Invalid Stellar account public key.',
       );
     }
   }

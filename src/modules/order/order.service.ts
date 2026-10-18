@@ -150,7 +150,7 @@ export class OrderService {
     };
   }
 
-  list(p: PaginationDto, q: OrderFilter): Promise<OrderWithRelations[]> {
+  list(p: PaginationDto, q: OrderFilter) {
     const where: Record<string, unknown> = {};
     if (q.offerId) where.offerId = q.offerId;
     if (q.buyerId) where.buyerId = q.buyerId;
@@ -160,7 +160,7 @@ export class OrderService {
     }
     if (q.status) where.orderStatus = q.status as order_status;
 
-    return this.repo.search(where, p.skip, p.take);
+    return this.repo.searchPage(where, p.skip ?? 0, p.take ?? 20);
   }
 
   async get(id: string): Promise<OrderWithRelations> {
@@ -176,6 +176,7 @@ export class OrderService {
 
   async update(id: string, dto: UpdateOrderDto): Promise<Order> {
     const data: Record<string, unknown> = { ...dto };
+    delete data.orderStatus;
     if (dto.expiresAt) data.expiresAt = new Date(dto.expiresAt);
     const updated = (await this.repo.update(id, data)) as Order;
 
@@ -289,9 +290,7 @@ export class OrderService {
       previousStatus: order.orderStatus,
     });
 
-    return this.repo.update(id, {
-      orderStatus: ORDER_STATUS.CANCELLED,
-    }) as Promise<Order>;
+    return this.repo.cancelAndReleaseReservation(id);
   }
 
   getUserStats(userId: string): Promise<UserStats> {
@@ -437,10 +436,16 @@ export class OrderService {
         : ORDER_STATUS.EXPIRED;
 
     // 3. Update order status in the database
-    await this.prisma.order.update({
-      where: { orderId: order.orderId },
-      data: { orderStatus: targetStatus },
-    });
+    await this.prisma.$transaction([
+      this.prisma.order.update({
+        where: { orderId: order.orderId },
+        data: { orderStatus: targetStatus },
+      }),
+      this.prisma.offer.updateMany({
+        where: { offerId: order.offerId, executed: true },
+        data: { executed: false },
+      }),
+    ]);
 
     // 4. Create Structured Audit Log
     this.logger.log('order.expiration.audit', {
