@@ -16,7 +16,11 @@ LocalSettle is a peer-to-peer marketplace that connects local payment methods wi
 
 ### Wallet authentication
 
-`POST /auth/challenge` creates a short-lived random challenge for a public key. The connected wallet signs it locally. `POST /auth/login` verifies the signature, consumes the challenge once, and returns a session token. The API verifies public-key ownership; it does not need the user's secret key for this flow.
+`POST /auth/challenge` creates a short-lived random challenge for a public key. The connected wallet signs it locally. `POST /auth/login` verifies the signature, consumes the challenge once, and returns a session token. The API verifies public-key ownership; it does not need the user's secret key for this flow. Each newly issued JWT is tied to a server-side session. Send the current bearer token to `POST /auth/logout` to revoke only that session; other signed-in devices remain active. Tokens issued before session tracking was deployed must be refreshed before they can be revoked.
+
+The login token is temporary and can be used to validate an alias and complete `POST /users/:id/setup`. That bootstrap route remains available before setup is complete. The setup response returns a final token with the `setupComplete: true` claim; profile, payment, trading, chat, and wallet routes that declare `SetupCompleteGuard` require that final token.
+
+Challenge issuance is limited independently by client IP and wallet (defaults: 10 requests per 60 seconds). Failed signature verification is limited independently by IP and wallet (defaults: 5 failures per 60 seconds). Configure these windows with `AUTH_CHALLENGE_RATE_LIMIT_MAX`, `AUTH_CHALLENGE_RATE_LIMIT_TTL_MS`, `AUTH_FAILED_SIGNATURE_RATE_LIMIT_MAX`, and `AUTH_FAILED_SIGNATURE_RATE_LIMIT_TTL_MS`. A legitimate user who reaches a limit should wait for that window to expire before requesting a new challenge or retrying a signature. Authentication audit events record only the operation and limit scope; wallet identifiers in those events are hashed.
 
 ### Direct USDC payment
 
@@ -92,12 +96,35 @@ The API listens on port `3001` by default. The frontend should point `NEXT_PUBLI
 | Route | Purpose |
 | --- | --- |
 | `POST /auth/challenge`, `POST /auth/login` | Wallet challenge-response session |
+| `POST /auth/logout` | Revokes the current bearer-token session |
 | `GET /stellar/account/:publicKey`, `GET /stellar/balances/:publicKey` | Stellar account and balance reads |
 | `GET /stellar/transactions` | Authenticated wallet payment history |
 | `GET /send/resolve`, `POST /send/prepare`, `POST /send/submit` | Prepare and submit a signed USDC payment |
 | `POST /escrows/open`, `POST /escrows/sync`, `GET /escrows/:id/status` | Escrow workflow and status |
 
 Routes have endpoint-specific validation and guards. Check the controller and DTO before relying on an endpoint's authentication or ownership behavior.
+
+Active payment providers are checked against provider-type metadata schema version 1 before being returned or used to create payment methods. The provider response includes `metadataSchemaVersion`; malformed UI requirements fail with a validation error so they do not reach trade screens.
+
+`POST /users/:id/setup` applies profile updates, an optional payment method, and the account setup audit row in one database transaction. Repeated setup requests reuse an existing matching payment method instead of creating another one.
+
+`PATCH /orders/:id` accepts only escrow-backed forward transitions: `created` to `locked` when escrow is funded, and `locked` to `released` or `disputed` when escrow has the matching terminal status. The write is conditional on the observed order and escrow states, so stale requests return HTTP 409 with the stable `ORDER_INVALID_TRANSITION` error code. Cancellation and expiration must use their dedicated flows. Terminal order states cannot be reopened through PATCH.
+
+`GET /orders/user-stats/:userId` requires a valid JWT. These private account metrics are available to the account owner and administrators only; the response is limited to total and completed order counts and contains no individual order or counterparty details.
+
+Offer updates require the current `expectedVersion` from the offer response. Successful updates increment the persisted version; stale versions return HTTP 409 with `OFFER_VERSION_CONFLICT`. Existing rows start at version `0` through the `add_offer_version` migration.
+
+Escrow evidence uploads accept only matching PDF, JPEG, PNG, or WebP extensions and MIME types. Storage keys use generated UUID filenames and are persisted in `evidence_key`; apply the `add_escrow_evidence_key` migration before deploying this change.
+
+Order creation records `ORDER_CREATED` in the same database transaction as the order, escrow record, and offer execution update. Audit storage errors therefore abort the complete database transaction instead of leaving a committed order without its audit record.
+
+Order creation derives and persists `fiatAmount` from the selected offer price and asset amount. The total is rounded to two decimal places using half-up rounding; a legacy client-supplied `fiatAmount` is accepted but ignored.
+
+Each payment history record retains the legacy `asset` and `asset_issuer` fields and adds `asset_descriptor` with the asset type, code, and issuer. Native XLM uses code `XLM` and a `null` issuer; issued assets include their issuer address.
+
+Stellar payment history accepts `limit` (default 10, maximum 200) and an optional Horizon `cursor`. The response is `{ records, nextCursor? }`; pass `nextCursor` as `cursor` to fetch the next page. `nextCursor` is omitted on the final page.
+
+Sensitive profile changes are recorded as `USER_PROFILE_UPDATED` audit events. Their metadata contains only changed field names (or requested field names on failure); submitted values are never copied into audit metadata. No-op requests are recorded with an empty field list. Profile-image updates use the same event with `profileImageUrl` as the sole field name.
 
 ## Development checks
 

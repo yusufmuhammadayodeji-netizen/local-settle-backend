@@ -42,7 +42,9 @@ export function errorCodeToHttpStatus(code: ErrorCode): HttpStatus {
 
     // ── 409 Conflict ──────────────────────────────────────────────────
     [ErrorCode.ALIAS_TAKEN]: HttpStatus.CONFLICT,
+    [ErrorCode.OFFER_VERSION_CONFLICT]: HttpStatus.CONFLICT,
     [ErrorCode.ORDER_CANCELLATION_NOT_ALLOWED]: HttpStatus.CONFLICT,
+    [ErrorCode.ORDER_INVALID_TRANSITION]: HttpStatus.CONFLICT,
 
     // ── 401 Unauthorized ─────────────────────────────────────────────
     [ErrorCode.KYC_WEBHOOK_INVALID_SIGNATURE]: HttpStatus.UNAUTHORIZED,

@@ -9,10 +9,10 @@ import {
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import * as crypto from 'crypto';
-import { Throttle } from '@nestjs/throttler';
 import { rateLimitConfig } from '../../config/rate-limit.config';
 import { AuthService } from './auth.service';
 import { AuthRateLimitGuard } from './auth-rate-limit.guard';
+import { JwtAuthGuard } from './jwt-auth.guard';
 import { CreateAuthChallengeDto } from './dto/create-auth-challenge.dto';
 import { LoginDto } from './dto/login.dto';
 import {
@@ -55,8 +55,11 @@ export class AuthController {
    */
   @Post('challenge')
   @UseGuards(AuthRateLimitGuard)
-  createChallenge(@Body() dto: CreateAuthChallengeDto) {
-    return this.authService.createChallenge(dto);
+  createChallenge(@Body() dto: CreateAuthChallengeDto, @Req() req: Request) {
+    return this.authService.createChallenge(dto, {
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    });
   }
 
   /**
@@ -64,14 +67,24 @@ export class AuthController {
    * after the signature proves ownership of the wallet. Passes request
    * context (IP, user agent) through for audit logging.
    */
-  @Throttle({ default: rateLimitConfig.auth })
   @Post('login')
-  @UseGuards(AuthRateLimitGuard)
   login(@Body() dto: LoginDto, @Req() req: Request) {
     const ctx = {
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'],
     };
     return this.authService.login(dto, ctx);
+  }
+
+  /** Revokes this bearer token without affecting the user's other sessions. */
+  @Post('logout')
+  @UseGuards(JwtAuthGuard)
+  logout(
+    @Req()
+    req: Request & {
+      user: { userId: string; sessionId?: string };
+    },
+  ) {
+    return this.authService.revokeSession(req.user.userId, req.user.sessionId);
   }
 }

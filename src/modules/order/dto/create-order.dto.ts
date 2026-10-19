@@ -8,6 +8,10 @@ import {
 } from 'class-validator';
 
 export class CreateOrderDto {
+  /** Stable UUID supplied by the client to make retries idempotent. */
+  @IsUUID()
+  idempotencyKey: string;
+
   @IsUUID()
   offerId: string;
 
@@ -20,8 +24,11 @@ export class CreateOrderDto {
   @IsNumberString()
   assetAmount: string;
 
+  // Accepted temporarily for old clients; persistence derives the total from
+  // the offer's current price and assetAmount instead of trusting this value.
+  @IsOptional()
   @IsNumberString()
-  fiatAmount: string;
+  fiatAmount?: string;
 
   @IsOptional()
   @IsIn(['created', 'locked', 'released', 'cancelled', 'expired', 'disputed'])

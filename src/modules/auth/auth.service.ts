@@ -1,9 +1,9 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { Keypair, StrKey } from '@stellar/stellar-sdk';
 import { AppUser } from '@prisma/client';
-import { createHash, randomBytes } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AppException, ErrorCode } from '../../common/errors';
 import { CreateAuthChallengeDto } from './dto/create-auth-challenge.dto';
@@ -23,6 +23,7 @@ export interface AuthChallengeResponse {
 }
 
 const DEFAULT_CHALLENGE_EXPIRATION_SECONDS = 300;
+const AUTH_TOKEN_TTL_MS = 60 * 60 * 1000;
 
 const ED25519_SIGNATURE_LENGTH = 64;
 
@@ -34,6 +35,10 @@ const BASE64_REGEX =
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  private readonly failedSignatureWindows = new Map<
+    string,
+    { count: number; windowStart: number }
+  >();
 
   constructor(
     private readonly jwtService: JwtService,
@@ -49,6 +54,7 @@ export class AuthService {
    */
   async createChallenge(
     dto: CreateAuthChallengeDto,
+    ctx: RequestContext = {},
   ): Promise<AuthChallengeResponse> {
     const { publicKey } = dto;
     this.assertValidPublicKey(publicKey);
@@ -68,6 +74,17 @@ export class AuthService {
       update: { challenge, expiresAt, usedAt: null, createdAt: new Date() },
     });
 
+    await this.auditLogService.create({
+      action: AuditAction.AUTH_CHALLENGE_CREATED,
+      resourceType: 'AuthChallenge',
+      resourceId: createHash('sha256').update(publicKey).digest('hex'),
+      result: AuditResult.SUCCESS,
+      ipAddress: ctx.ipAddress,
+      userAgent: ctx.userAgent,
+      correlationId: ctx.correlationId,
+      metadata: { operation: 'challenge', scope: 'wallet_and_ip' },
+    });
+
     return { challenge, expiresAt: expiresAt.toISOString() };
   }
 
@@ -82,6 +99,7 @@ export class AuthService {
   ): Promise<{ access_token: string; user: AppUser }> {
     const { publicKey, challenge, signature } = dto;
     this.assertValidPublicKey(publicKey);
+    this.assertFailedSignatureLimit(publicKey, ctx.ipAddress);
 
     const stored = await this.prisma.authChallenge.findUnique({
       where: { publicKey },
@@ -104,7 +122,14 @@ export class AuthService {
       );
     }
 
-    const signatureBytes = this.decodeSignature(signature);
+    let signatureBytes: Buffer;
+    try {
+      signatureBytes = this.decodeSignature(signature);
+    } catch (error) {
+      this.recordFailedSignature(publicKey, ctx.ipAddress);
+      await this.recordLoginFailure(publicKey, ctx, 'malformed_signature');
+      throw error;
+    }
 
     let isValidSignature = false;
     try {
@@ -129,6 +154,7 @@ export class AuthService {
     }
 
     if (!isValidSignature) {
+      this.recordFailedSignature(publicKey, ctx.ipAddress);
       await this.recordLoginFailure(publicKey, ctx, 'invalid_signature');
       throw new AppException(
         ErrorCode.INVALID_SIGNATURE,
@@ -160,11 +186,6 @@ export class AuthService {
       update: {},
     });
 
-    const payload: { sub: string; publicKey: string } = {
-      sub: user.userId,
-      publicKey,
-    };
-
     await this.auditLogService.create({
       action: AuditAction.USER_LOGIN_SUCCESS,
       resourceType: 'User',
@@ -176,7 +197,7 @@ export class AuthService {
     });
 
     return {
-      access_token: this.jwtService.sign(payload),
+      access_token: await this.createSessionToken(user.userId, publicKey),
       user,
     };
   }
@@ -184,16 +205,56 @@ export class AuthService {
   /**
    * Generates a definitive JWT after the user has completed their profile setup.
    */
-  finalizeSetup(userId: string, publicKey: string): { access_token: string } {
-    const payload: { sub: string; publicKey: string; setupComplete: boolean } =
-      {
-        sub: userId,
-        publicKey,
-        setupComplete: true,
-      };
+  async finalizeSetup(
+    userId: string,
+    publicKey: string,
+  ): Promise<{ access_token: string }> {
     return {
-      access_token: this.jwtService.sign(payload),
+      access_token: await this.createSessionToken(userId, publicKey, true),
     };
+  }
+
+  /** Revokes only the authenticated JWT session, leaving other devices active. */
+  async revokeSession(
+    userId: string,
+    sessionId?: string,
+  ): Promise<{ revoked: boolean }> {
+    if (!sessionId) {
+      throw new UnauthorizedException(
+        'This token does not support session revocation; sign in again',
+      );
+    }
+
+    const result = await this.prisma.authSession.updateMany({
+      where: { sessionId, userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+
+    return { revoked: result.count > 0 };
+  }
+
+  private async createSessionToken(
+    userId: string,
+    publicKey: string,
+    setupComplete = false,
+  ): Promise<string> {
+    const sessionId = randomUUID();
+    await this.prisma.authSession.create({
+      data: {
+        sessionId,
+        userId,
+        expiresAt: new Date(Date.now() + AUTH_TOKEN_TTL_MS),
+      },
+    });
+
+    const payload: {
+      sub: string;
+      publicKey: string;
+      setupComplete?: boolean;
+    } = { sub: userId, publicKey };
+    if (setupComplete) payload.setupComplete = true;
+
+    return this.jwtService.sign(payload, { jwtid: sessionId });
   }
 
   private async recordLoginFailure(
@@ -211,6 +272,72 @@ export class AuthService {
       correlationId: ctx.correlationId,
       metadata: { reason },
     });
+  }
+
+  private assertFailedSignatureLimit(publicKey: string, ipAddress?: string) {
+    const keys = [
+      `wallet:${publicKey}`,
+      ...(ipAddress ? [`ip:${ipAddress}`] : []),
+    ];
+    const now = Date.now();
+    const ttl = this.getPositiveInteger(
+      'AUTH_FAILED_SIGNATURE_RATE_LIMIT_TTL_MS',
+      60_000,
+    );
+    const limit = this.getPositiveInteger(
+      'AUTH_FAILED_SIGNATURE_RATE_LIMIT_MAX',
+      5,
+    );
+    const exceeded = keys.find((key) => {
+      const window = this.failedSignatureWindows.get(key);
+      if (window && now - window.windowStart >= ttl) {
+        this.failedSignatureWindows.delete(key);
+        return false;
+      }
+      return Boolean(window && window.count >= limit);
+    });
+    if (exceeded) {
+      void this.auditLogService.create({
+        action: AuditAction.AUTH_RATE_LIMITED,
+        resourceType: 'AuthLogin',
+        resourceId: createHash('sha256').update(publicKey).digest('hex'),
+        result: AuditResult.FAILURE,
+        ipAddress,
+        metadata: {
+          operation: 'failed_signature',
+          scope: exceeded.startsWith('ip:') ? 'ip' : 'wallet',
+        },
+      });
+      throw new AppException(
+        ErrorCode.TOO_MANY_REQUESTS,
+        'Too many failed signatures for this wallet and IP. Please retry after the rate-limit window.',
+      );
+    }
+  }
+
+  private recordFailedSignature(publicKey: string, ipAddress?: string): void {
+    const keys = [
+      `wallet:${publicKey}`,
+      ...(ipAddress ? [`ip:${ipAddress}`] : []),
+    ];
+    const now = Date.now();
+    const ttl = this.getPositiveInteger(
+      'AUTH_FAILED_SIGNATURE_RATE_LIMIT_TTL_MS',
+      60_000,
+    );
+    for (const key of keys) {
+      const current = this.failedSignatureWindows.get(key);
+      if (!current || now - current.windowStart >= ttl) {
+        this.failedSignatureWindows.set(key, { count: 1, windowStart: now });
+      } else {
+        current.count += 1;
+      }
+    }
+  }
+
+  private getPositiveInteger(name: string, fallback: number): number {
+    const parsed = Number(process.env[name]);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
   }
 
   private assertValidPublicKey(publicKey: string): void {

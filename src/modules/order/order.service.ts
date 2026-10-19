@@ -1,5 +1,5 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { randomUUID } from 'crypto';
+import { ConflictException, Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { PaginationDto } from '../../common/pagination.dto';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { UpdateOrderDto } from './dto/update-order.dto';
@@ -9,14 +9,17 @@ import { EscrowService } from '../escrow/escrow.service';
 import { AppException, ErrorCode } from '../../common/errors';
 import {
   Order,
+  Prisma,
   order_status,
   escrow_status,
   EscrowOnChain,
 } from '@prisma/client';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
+import { CreateAuditLogInput } from '../audit-log/interfaces/create-audit-log.interface';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { ORDER_STATUS } from './order.constants';
+import { ORDER_STATUS, PATCHABLE_ORDER_TRANSITIONS } from './order.constants';
+import { AppRole } from '../../common/interfaces/app-role.interface';
 import {
   ORDER_PARTY_CONTACT_SELECT,
   OrderPartyContact,
@@ -42,9 +45,9 @@ type OrderCreateData = {
   buyerId: string;
   sellerId: string;
   assetAmount: string;
-  fiatAmount: string;
   orderStatus?: string;
   expiresAt?: Date;
+  auditLog: CreateAuditLogInput;
   escrow: {
     contractId: string;
     sellerAddress: string;
@@ -82,28 +85,105 @@ export class OrderService {
   /**
    * Atomic order + escrow creation.
    *
-   * 1. Pre-generate an orderId (UUIDv4).
-   * 2. Call EscrowService.deployEscrowToChain() ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â interacts ONLY with TW API.
-   *    If this fails the method throws and NO database record is created.
-   * 3. Persist Order + EscrowOnChain in a single DB transaction.
-   * 4. Return the order data with the unsigned fund XDR so the frontend can
-   *    prompt the seller to sign.
+   * Reserve the caller's idempotency key before talking to the chain. The
+   * reservation gives every retry the same engagement/order ID and records a
+   * completed deployment before the order transaction starts, so a database
+   * failure after deployment can be retried without redeploying the escrow.
    */
   async create(dto: CreateOrderDto): Promise<OrderDetailResponse> {
-    const orderId = randomUUID();
+    const requestHash = createHash('sha256')
+      .update(JSON.stringify({
+        offerId: dto.offerId,
+        buyerId: dto.buyerId,
+        sellerId: dto.sellerId,
+        assetAmount: dto.assetAmount,
+        fiatAmount: dto.fiatAmount,
+        orderStatus: dto.orderStatus ?? null,
+        expiresAt: dto.expiresAt ?? null,
+        sellerAddress: dto.sellerAddress,
+        buyerAddress: dto.buyerAddress,
+        assetCode: dto.assetCode,
+        title: dto.title ?? null,
+      }))
+      .digest('hex');
+    const { reservation, created } = await this.repo.reserveOrderCreation({
+      idempotencyKey: dto.idempotencyKey,
+      requestHash,
+      buyerId: dto.buyerId,
+      sellerId: dto.sellerId,
+    });
+    if (reservation.request_hash !== requestHash) {
+      throw new ConflictException(
+        'This idempotency key was already used with a different order request',
+      );
+    }
+    const orderId = reservation.order_id;
 
     this.logger.log(
       `Creating order ${orderId} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â deploying escrow to chain firstÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦`,
     );
 
-    const { contractId, unsignedFundTransaction } =
-      await this.escrowService.deployEscrowToChain(orderId, {
+    const existingOrder = await this.repo.findById(orderId);
+    if (existingOrder) {
+      await this.repo.completeOrderCreation(dto.idempotencyKey);
+      const contractId = existingOrder.escrow?.contractId;
+      if (!contractId || !reservation.unsigned_fund_transaction) {
+        throw new ConflictException(
+          'Order creation is persisted but its escrow response needs reconciliation',
+        );
+      }
+      return {
+        ...existingOrder,
+        escrowId: existingOrder.escrow.escrowId,
+        escrow: { escrowId: existingOrder.escrow.escrowId },
+        contractId,
+        unsignedFundTransaction: reservation.unsigned_fund_transaction,
+      };
+    }
+    if (reservation.status === 'completed') {
+      throw new ConflictException(
+        `Completed order creation ${orderId} has no persisted order and needs reconciliation`,
+      );
+    }
+    if (reservation.status === 'pending' && !created) {
+      throw new ConflictException(
+        `Order creation ${orderId} is already in progress or needs chain reconciliation`,
+      );
+    }
+
+    let contractId = reservation.contract_id;
+    let unsignedFundTransaction = reservation.unsigned_fund_transaction;
+    if (reservation.status === 'pending') {
+      const activeDuplicate = await this.repo.findActiveForOfferBuyer(
+        dto.offerId,
+        dto.buyerId,
+      );
+      if (activeDuplicate) {
+        throw new AppException(
+          ErrorCode.INVALID_ORDER_STATUS,
+          'An active order already exists for this buyer and offer.',
+        );
+      }
+      const deployment = await this.escrowService.deployEscrowToChain(orderId, {
         sellerAddress: dto.sellerAddress,
         buyerAddress: dto.buyerAddress,
         amount: Number(dto.assetAmount),
         assetCode: dto.assetCode,
         title: dto.title ?? `Order ${orderId}`,
       });
+      contractId = deployment.contractId;
+      unsignedFundTransaction = deployment.unsignedFundTransaction;
+      await this.repo.saveOrderDeployment(
+        dto.idempotencyKey,
+        contractId,
+        unsignedFundTransaction,
+      );
+    }
+    if (!contractId || !unsignedFundTransaction) {
+      throw new ConflictException(
+        `Escrow deployment for order ${orderId} needs reconciliation`,
+      );
+    }
 
     this.logger.log(
       `Escrow deployed (contract=${contractId}). Persisting order + escrow in DBÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦`,
@@ -115,9 +195,16 @@ export class OrderService {
       buyerId: dto.buyerId,
       sellerId: dto.sellerId,
       assetAmount: dto.assetAmount,
-      fiatAmount: dto.fiatAmount,
       orderStatus: dto.orderStatus,
       expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : undefined,
+      auditLog: {
+        userId: dto.buyerId,
+        action: AuditAction.ORDER_CREATED,
+        resourceType: 'Order',
+        resourceId: orderId,
+        result: AuditResult.SUCCESS,
+        metadata: { offerId: dto.offerId, sellerId: dto.sellerId },
+      },
       escrow: {
         contractId,
         sellerAddress: dto.sellerAddress,
@@ -129,17 +216,9 @@ export class OrderService {
     const order: OrderCreateResponse = (await this.repo.create(
       data,
     )) as OrderCreateResponse;
+    await this.repo.completeOrderCreation(dto.idempotencyKey);
 
     this.logger.log(`Order ${orderId} and escrow persisted successfully.`);
-
-    await this.auditLogService.create({
-      userId: dto.buyerId,
-      action: AuditAction.ORDER_CREATED,
-      resourceType: 'Order',
-      resourceId: orderId,
-      result: AuditResult.SUCCESS,
-      metadata: { offerId: dto.offerId, sellerId: dto.sellerId },
-    });
 
     // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Return combined response ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
     return {
@@ -150,7 +229,29 @@ export class OrderService {
     };
   }
 
-  list(p: PaginationDto, q: OrderFilter): Promise<OrderWithRelations[]> {
+  async getCreationStatus(idempotencyKey: string, userId: string) {
+    const reservation =
+      await this.repo.getOrderCreationReservation(idempotencyKey);
+    if (!reservation) {
+      throw new AppException(
+        ErrorCode.ORDER_NOT_FOUND,
+        `Order creation ${idempotencyKey} not found`,
+      );
+    }
+    if (reservation.buyer_id !== userId && reservation.seller_id !== userId) {
+      throw new AppException(
+        ErrorCode.UNAUTHORIZED_ACTION,
+        'Only the order buyer or seller can inspect its creation status',
+      );
+    }
+    return {
+      orderId: reservation.order_id,
+      status: reservation.status,
+      contractId: reservation.contract_id,
+    };
+  }
+
+  list(p: PaginationDto, q: OrderFilter) {
     const where: Record<string, unknown> = {};
     if (q.offerId) where.offerId = q.offerId;
     if (q.buyerId) where.buyerId = q.buyerId;
@@ -160,7 +261,7 @@ export class OrderService {
     }
     if (q.status) where.orderStatus = q.status as order_status;
 
-    return this.repo.search(where, p.skip, p.take);
+    return this.repo.searchPage(where, p.skip ?? 0, p.take ?? 20);
   }
 
   async get(id: string): Promise<OrderWithRelations> {
@@ -175,9 +276,73 @@ export class OrderService {
   }
 
   async update(id: string, dto: UpdateOrderDto): Promise<Order> {
+    let currentOrder: OrderWithRelations | null = null;
+    let expectedEscrowStatus: escrow_status | undefined;
+    if (dto.orderStatus !== undefined) {
+      currentOrder = await this.repo.findById(id);
+      if (!currentOrder) {
+        throw new AppException(
+          ErrorCode.ORDER_NOT_FOUND,
+          `Order ${id} not found`,
+        );
+      }
+
+      const allowedNextStatuses =
+        PATCHABLE_ORDER_TRANSITIONS[currentOrder.orderStatus] ?? [];
+      if (
+        dto.orderStatus !== currentOrder.orderStatus &&
+        !allowedNextStatuses.includes(dto.orderStatus)
+      ) {
+        throw new AppException(
+          ErrorCode.ORDER_INVALID_TRANSITION,
+          `Order cannot transition from "${currentOrder.orderStatus}" to "${dto.orderStatus}" through PATCH; use the dedicated cancellation or escrow flow`,
+        );
+      }
+
+      const requiredEscrowByOrderStatus: Partial<
+        Record<order_status, escrow_status>
+      > = {
+        locked: 'funded',
+        released: 'released',
+        disputed: 'disputed',
+      };
+      expectedEscrowStatus =
+        requiredEscrowByOrderStatus[dto.orderStatus];
+      if (
+        dto.orderStatus !== currentOrder.orderStatus &&
+        (!currentOrder.escrow ||
+          currentOrder.escrow.escrowStatus !== expectedEscrowStatus)
+      ) {
+        throw new AppException(
+          ErrorCode.ORDER_INVALID_TRANSITION,
+          `Order cannot transition to "${dto.orderStatus}" unless its escrow is "${expectedEscrowStatus}"`,
+        );
+      }
+    }
+
     const data: Record<string, unknown> = { ...dto };
+    delete data.orderStatus;
     if (dto.expiresAt) data.expiresAt = new Date(dto.expiresAt);
-    const updated = (await this.repo.update(id, data)) as Order;
+    let updated: Order;
+    if (currentOrder && dto.orderStatus !== undefined) {
+      const applied = await this.repo.updateIfStatusesMatch(
+        id,
+        currentOrder.orderStatus,
+        dto.orderStatus === currentOrder.orderStatus
+          ? undefined
+          : expectedEscrowStatus,
+        { ...data, orderStatus: dto.orderStatus } as Prisma.OrderUpdateManyMutationInput,
+      );
+      if (!applied) {
+        throw new AppException(
+          ErrorCode.ORDER_INVALID_TRANSITION,
+          'Order or escrow status changed while applying the requested transition; reload the order and retry',
+        );
+      }
+      updated = (await this.repo.findById(id)) as Order;
+    } else {
+      updated = (await this.repo.update(id, data)) as Order;
+    }
 
     // Record cancellation/expiration explicitly when the update sets the
     // order into one of those terminal statuses; other field updates
@@ -289,12 +454,24 @@ export class OrderService {
       previousStatus: order.orderStatus,
     });
 
-    return this.repo.update(id, {
-      orderStatus: ORDER_STATUS.CANCELLED,
-    }) as Promise<Order>;
+    return this.repo.cancelAndReleaseReservation(id);
   }
 
-  getUserStats(userId: string): Promise<UserStats> {
+  async getUserStats(userId: string, requesterId: string): Promise<UserStats> {
+    // Account-level order metrics are private. Owners can view their own
+    // counts; only administrators may inspect another account's counts.
+    if (userId !== requesterId) {
+      const requester = await this.prisma.appUser.findUnique({
+        where: { userId: requesterId },
+        select: { role: true },
+      });
+      if (!requester || requester.role !== AppRole.admin) {
+        throw new AppException(
+          ErrorCode.UNAUTHORIZED_ACTION,
+          'Only the account owner or an administrator can view these order statistics',
+        );
+      }
+    }
     return this.repo.getUserStats(userId);
   }
 
@@ -437,10 +614,16 @@ export class OrderService {
         : ORDER_STATUS.EXPIRED;
 
     // 3. Update order status in the database
-    await this.prisma.order.update({
-      where: { orderId: order.orderId },
-      data: { orderStatus: targetStatus },
-    });
+    await this.prisma.$transaction([
+      this.prisma.order.update({
+        where: { orderId: order.orderId },
+        data: { orderStatus: targetStatus },
+      }),
+      this.prisma.offer.updateMany({
+        where: { offerId: order.offerId, executed: true },
+        data: { executed: false },
+      }),
+    ]);
 
     // 4. Create Structured Audit Log
     this.logger.log('order.expiration.audit', {

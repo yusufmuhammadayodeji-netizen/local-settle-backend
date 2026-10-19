@@ -8,6 +8,7 @@ import { PaymentMethodValidatorService } from '../payment-methods/payment-method
 import { PaginationDto } from '../../common/pagination.dto';
 import { USER_PUBLIC_SELECT } from '../../common/prisma-selects';
 import { AuditLogService } from '../audit-log/audit-log.service';
+import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
 
 describe('UsersService', () => {
   let service: UsersService;
@@ -16,21 +17,27 @@ describe('UsersService', () => {
     findById: jest.Mock;
     findMany: jest.Mock;
     findExportData: jest.Mock;
+    isAliasAvailable: jest.Mock;
   };
   let mockFileStorageService: {
     uploadFile: jest.Mock;
   };
   let mockPrismaService: {
     waitlist: { findUnique: jest.Mock; deleteMany: jest.Mock };
+    payment_provider: { findUnique: jest.Mock };
     $transaction: jest.Mock;
   };
   let mockAuditLogService: {
     create: jest.Mock;
   };
   let txClient: {
-    paymentMethod: { deleteMany: jest.Mock };
+    paymentMethod: {
+      deleteMany: jest.Mock;
+      findFirst: jest.Mock;
+      create: jest.Mock;
+    };
     chatMessage: { updateMany: jest.Mock };
-    auditLog: { updateMany: jest.Mock };
+    auditLog: { updateMany: jest.Mock; create: jest.Mock };
     waitlist: { deleteMany: jest.Mock };
     appUser: { findUnique: jest.Mock; update: jest.Mock };
   };
@@ -41,6 +48,7 @@ describe('UsersService', () => {
       findById: jest.fn(),
       findMany: jest.fn().mockResolvedValue([]),
       findExportData: jest.fn(),
+      isAliasAvailable: jest.fn().mockResolvedValue(true),
     };
 
     mockFileStorageService = {
@@ -48,15 +56,26 @@ describe('UsersService', () => {
     };
 
     txClient = {
-      paymentMethod: { deleteMany: jest.fn() },
+      paymentMethod: {
+        deleteMany: jest.fn(),
+        findFirst: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockResolvedValue({ paymentId: 'payment-1' }),
+      },
       chatMessage: { updateMany: jest.fn() },
-      auditLog: { updateMany: jest.fn() },
+      auditLog: { updateMany: jest.fn(), create: jest.fn() },
       waitlist: { deleteMany: jest.fn() },
-      appUser: { findUnique: jest.fn(), update: jest.fn() },
+      appUser: {
+        findUnique: jest.fn(),
+        update: jest.fn().mockResolvedValue({
+          userId: 'user-1',
+          publicKey: 'G'.padEnd(56, 'A'),
+        }),
+      },
     };
 
     mockPrismaService = {
       waitlist: { findUnique: jest.fn(), deleteMany: jest.fn() },
+      payment_provider: { findUnique: jest.fn() },
       $transaction: jest.fn((cb: (tx: typeof txClient) => unknown) =>
         cb(txClient),
       ),
@@ -71,9 +90,15 @@ describe('UsersService', () => {
         UsersService,
         { provide: UsersRepository, useValue: repo },
         { provide: PrismaService, useValue: mockPrismaService },
-        { provide: AuthService, useValue: {} },
+        {
+          provide: AuthService,
+          useValue: { finalizeSetup: jest.fn().mockResolvedValue({ access_token: 'token' }) },
+        },
         { provide: FileStorageService, useValue: mockFileStorageService },
-        { provide: PaymentMethodValidatorService, useValue: {} },
+        {
+          provide: PaymentMethodValidatorService,
+          useValue: { validate: jest.fn() },
+        },
         { provide: AuditLogService, useValue: mockAuditLogService },
       ],
     }).compile();
@@ -92,6 +117,55 @@ describe('UsersService', () => {
     expect(args.select).not.toHaveProperty('currentNonce');
   });
 
+  describe('setupAccount transaction', () => {
+    const dto = {
+      alias: 'new-alias',
+      providerId: 'provider-1',
+      accountIdentifier: 'account-123',
+      beneficiaryName: 'Ada User',
+    };
+
+    beforeEach(() => {
+      mockPrismaService.payment_provider.findUnique.mockResolvedValue({
+        type: 'BANK',
+        country_code: 'US',
+        metadata: null,
+      });
+    });
+
+    it('commits profile, payment method, and audit writes in one transaction', async () => {
+      await expect(service.setupAccount('user-1', dto)).resolves.toEqual({
+        user: expect.objectContaining({ userId: 'user-1' }),
+        access_token: 'token',
+      });
+
+      expect(mockPrismaService.$transaction).toHaveBeenCalledTimes(1);
+      expect(txClient.appUser.update).toHaveBeenCalledWith({
+        where: { userId: 'user-1' },
+        data: { alias: 'new-alias', pendingAccountInfo: false },
+      });
+      expect(txClient.paymentMethod.create).toHaveBeenCalledTimes(1);
+      expect(txClient.auditLog.create).toHaveBeenCalledTimes(1);
+      expect(repo.update).not.toHaveBeenCalled();
+    });
+
+    it('avoids duplicate payment methods on a repeated setup request', async () => {
+      txClient.paymentMethod.findFirst.mockResolvedValue({ paymentId: 'existing' });
+
+      await service.setupAccount('user-1', dto);
+
+      expect(txClient.paymentMethod.create).not.toHaveBeenCalled();
+    });
+
+    it('propagates audit storage failures so the transaction rolls back', async () => {
+      txClient.auditLog.create.mockRejectedValue(new Error('audit unavailable'));
+
+      await expect(service.setupAccount('user-1', dto)).rejects.toThrow(
+        'audit unavailable',
+      );
+    });
+  });
+
   it('updates the user when the authenticated user owns the resource', async () => {
     const updatedUser = { userId: 'user-1', alias: 'new-alias' };
     repo.findById.mockResolvedValue({ userId: 'user-1', alias: 'new-alias' });
@@ -101,7 +175,84 @@ describe('UsersService', () => {
       service.update('user-1', { alias: 'new-alias' }, 'user-1'),
     ).resolves.toEqual(updatedUser);
 
-    expect(repo.update).toHaveBeenCalledWith('user-1', { alias: 'new-alias' });
+    expect(repo.update).toHaveBeenCalledWith('user-1', {
+      alias: 'new-alias',
+      aliasNormalized: 'new-alias',
+    });
+  });
+
+  it('audits a no-op sensitive profile update with no changed values', async () => {
+    const user = { userId: 'user-1', bio: 'Same bio' };
+    repo.findById.mockResolvedValue(user);
+    repo.update.mockResolvedValue(user);
+
+    await service.update('user-1', { bio: 'Same bio' }, 'user-1');
+
+    expect(mockAuditLogService.create).toHaveBeenCalledWith({
+      action: AuditAction.USER_PROFILE_UPDATED,
+      resourceType: 'User',
+      resourceId: 'user-1',
+      result: AuditResult.SUCCESS,
+      metadata: { fields: [] },
+    });
+  });
+
+  it('audits only the names of sensitive fields changed together', async () => {
+    repo.findById.mockResolvedValue({
+      userId: 'user-1',
+      alias: 'old-name',
+      preferredCurrency: 'USD',
+      bio: 'old bio',
+      securityUpdates: false,
+    });
+    repo.update.mockResolvedValue({ userId: 'user-1' });
+
+    await service.update(
+      'user-1',
+      {
+        alias: 'new-name',
+        preferredCurrency: 'EUR',
+        bio: 'new bio',
+        securityUpdates: true,
+      },
+      'user-1',
+    );
+
+    expect(mockAuditLogService.create).toHaveBeenCalledWith({
+      action: AuditAction.USER_PROFILE_UPDATED,
+      resourceType: 'User',
+      resourceId: 'user-1',
+      result: AuditResult.SUCCESS,
+      metadata: {
+        fields: ['alias', 'preferredCurrency', 'bio', 'securityUpdates'],
+      },
+    });
+    expect(JSON.stringify(mockAuditLogService.create.mock.calls)).not.toContain(
+      'new-name',
+    );
+    expect(JSON.stringify(mockAuditLogService.create.mock.calls)).not.toContain(
+      'EUR',
+    );
+  });
+
+  it('audits failed sensitive profile changes using field names only', async () => {
+    repo.findById.mockResolvedValue({ userId: 'user-1', alias: 'old-name' });
+    repo.isAliasAvailable.mockResolvedValue(false);
+
+    await expect(
+      service.update('user-1', { alias: 'taken-name' }, 'user-1'),
+    ).rejects.toThrow();
+
+    expect(mockAuditLogService.create).toHaveBeenCalledWith({
+      action: AuditAction.USER_PROFILE_UPDATED,
+      resourceType: 'User',
+      resourceId: 'user-1',
+      result: AuditResult.FAILURE,
+      metadata: { fields: ['alias'] },
+    });
+    expect(JSON.stringify(mockAuditLogService.create.mock.calls)).not.toContain(
+      'taken-name',
+    );
   });
 
   it('sets kycUpdatedAt only after ownership is validated', async () => {

@@ -17,6 +17,8 @@ import { PaymentMethodValidatorService } from '../payment-methods/payment-method
 import { USER_PUBLIC_SELECT, PublicUser } from '../../common/prisma-selects';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
+import { validatePaymentProviderMetadata } from '../payment-providers/payment-provider-metadata.validator';
+import { normalizeAlias } from './alias-normalization';
 
 export interface AliasAvailability {
   available: boolean;
@@ -34,6 +36,14 @@ export interface UploadResult {
 
 @Injectable()
 export class UsersService {
+  private readonly auditedProfileFields = [
+    'alias',
+    'preferredCurrency',
+    'profileImageUrl',
+    'bio',
+    'securityUpdates',
+    'notificationsEnabled',
+  ] as const;
   constructor(
     private readonly repo: UsersRepository,
     private readonly prisma: PrismaService,
@@ -85,17 +95,18 @@ export class UsersService {
       ...profileData
     } = dto;
 
-    const updatedUser: AppUser = (await this.repo.update(userId, {
-      ...(profileData as unknown as Record<string, unknown>),
-      pendingAccountInfo: false,
-    })) as AppUser;
+    const accountData = profileData as unknown as Record<string, unknown>;
+    if (typeof accountData.alias === 'string') {
+      accountData.aliasNormalized = normalizeAlias(accountData.alias);
+    }
 
     void bankName;
     void accountHolderName;
     void accountNumber;
 
+    let provider: Awaited<ReturnType<PrismaService['payment_provider']['findUnique']>> = null;
     if (providerId && accountIdentifier) {
-      const provider = await this.prisma.payment_provider.findUnique({
+      provider = await this.prisma.payment_provider.findUnique({
         where: { provider_id: providerId },
       });
 
@@ -106,6 +117,8 @@ export class UsersService {
         );
       }
 
+      validatePaymentProviderMetadata(provider.type, provider.metadata);
+
       this.paymentMethodValidator.validate(
         {
           type: provider.type,
@@ -115,19 +128,49 @@ export class UsersService {
         },
         accountIdentifier,
       );
+    }
 
-      await this.prisma.paymentMethod.create({
+    const updatedUser = await this.prisma.$transaction(async (tx) => {
+      const user = await tx.appUser.update({
+        where: { userId },
         data: {
-          userId,
-          providerId,
-          type: provider.type,
-          accountIdentifier,
-          identificationNumber,
-          beneficiaryName,
-          description,
+          ...accountData,
+          pendingAccountInfo: false,
         },
       });
-    }
+
+      if (provider && providerId && accountIdentifier) {
+        const existingMethod = await tx.paymentMethod.findFirst({
+          where: { userId, providerId, accountIdentifier },
+          select: { paymentId: true },
+        });
+        if (!existingMethod) {
+          await tx.paymentMethod.create({
+            data: {
+              userId,
+              providerId,
+              type: provider.type,
+              accountIdentifier,
+              identificationNumber,
+              beneficiaryName,
+              description,
+            },
+          });
+        }
+      }
+
+      await tx.auditLog.create({
+        data: {
+          userId,
+          action: AuditAction.USER_ACCOUNT_SETUP,
+          resourceType: 'User',
+          resourceId: userId,
+          result: AuditResult.SUCCESS,
+          metadata: { paymentMethodIncluded: Boolean(providerId && accountIdentifier) },
+        },
+      });
+      return user;
+    });
 
     const { access_token } = await Promise.resolve(
       this.authService.finalizeSetup(userId, updatedUser.publicKey),
@@ -144,9 +187,11 @@ export class UsersService {
         'A user with this public key already exists',
       );
     }
-    return this.repo.create(
-      dto as unknown as Record<string, unknown>,
-    ) as Promise<AppUser>;
+    const data = dto as unknown as Record<string, unknown>;
+    if (typeof data.alias === 'string') {
+      data.aliasNormalized = normalizeAlias(data.alias);
+    }
+    return this.repo.create(data) as Promise<AppUser>;
   }
 
   list(p: PaginationDto): Promise<PublicUser[]> {
@@ -175,22 +220,26 @@ export class UsersService {
     dto: UpdateUserDto,
     callerUserId?: string,
   ): Promise<AppUser> {
-    if (callerUserId && callerUserId !== id) {
-      throw new AppException(
-        ErrorCode.UNAUTHORIZED_ACTION,
-        'You can only update your own profile.',
-      );
-    }
+    const requestedFields = this.getAuditedProfileFields(dto);
+    try {
+      if (callerUserId && callerUserId !== id) {
+        throw new AppException(
+          ErrorCode.UNAUTHORIZED_ACTION,
+          'You can only update your own profile.',
+        );
+      }
 
-    if (dto.alias) {
-      const user = (await this.repo.findById(id)) as AppUser | null;
-      if (!user) {
+      const currentUser = requestedFields.length
+        ? ((await this.repo.findById(id)) as AppUser | null)
+        : null;
+      if (requestedFields.length && !currentUser) {
         throw new AppException(
           ErrorCode.USER_NOT_FOUND,
           `User ${id} not found`,
         );
       }
-      if (user.alias !== dto.alias) {
+
+      if (dto.alias && currentUser && currentUser.alias !== dto.alias) {
         const isAvailable = await this.repo.isAliasAvailable(dto.alias);
         if (!isAvailable) {
           throw new AppException(
@@ -199,11 +248,52 @@ export class UsersService {
           );
         }
       }
-    }
 
-    const data: Record<string, unknown> = { ...dto };
-    if (dto.kycStatus) data.kycUpdatedAt = new Date();
-    return this.repo.update(id, data) as Promise<AppUser>;
+      const data: Record<string, unknown> = { ...dto };
+      if (typeof dto.alias === 'string') {
+        data.aliasNormalized = normalizeAlias(dto.alias);
+      }
+      if (dto.kycStatus) data.kycUpdatedAt = new Date();
+      const updated = (await this.repo.update(id, data)) as AppUser;
+      const changedFields = requestedFields.filter(
+        (field) =>
+          currentUser &&
+          (currentUser as unknown as Record<string, unknown>)[field] !==
+            (dto as unknown as Record<string, unknown>)[field],
+      );
+      await this.recordProfileUpdate(id, changedFields, AuditResult.SUCCESS);
+      return updated;
+    } catch (error) {
+      if (requestedFields.length) {
+        await this.recordProfileUpdate(
+          id,
+          requestedFields,
+          AuditResult.FAILURE,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private getAuditedProfileFields(dto: UpdateUserDto): string[] {
+    const provided = dto as unknown as Record<string, unknown>;
+    return this.auditedProfileFields.filter((field) =>
+      Object.prototype.hasOwnProperty.call(provided, field),
+    );
+  }
+
+  private recordProfileUpdate(
+    userId: string,
+    fields: string[],
+    result: AuditResult,
+  ): Promise<void> {
+    return this.auditLogService.create({
+      action: AuditAction.USER_PROFILE_UPDATED,
+      resourceType: 'User',
+      resourceId: userId,
+      result,
+      metadata: { fields },
+    });
   }
 
   async uploadProfilePicture(
@@ -211,26 +301,50 @@ export class UsersService {
     file: UploadFileInput,
     userSnapshot?: Record<string, unknown>,
   ): Promise<AppUser | UploadResult> {
-    if (process.env.MOCK_PROFILE_UPLOAD === 'true') {
+    try {
+      if (process.env.MOCK_PROFILE_UPLOAD === 'true') {
+        const uploadedFile: StoredFile =
+          await this.fileStorageService.uploadFile(file);
+        const result = {
+          ...(userSnapshot ?? {}),
+          userId: id,
+          profileImageUrl: uploadedFile.url,
+        };
+        await this.recordProfileUpdate(
+          id,
+          ['profileImageUrl'],
+          AuditResult.SUCCESS,
+        );
+        return result;
+      }
+
+      const user = (await this.repo.findById(id)) as AppUser | null;
+      if (!user) {
+        throw new AppException(
+          ErrorCode.USER_NOT_FOUND,
+          `User ${id} not found`,
+        );
+      }
+
       const uploadedFile: StoredFile =
         await this.fileStorageService.uploadFile(file);
-      return {
-        ...(userSnapshot ?? {}),
-        userId: id,
+      const result = (await this.repo.update(id, {
         profileImageUrl: uploadedFile.url,
-      };
+      })) as AppUser;
+      await this.recordProfileUpdate(
+        id,
+        ['profileImageUrl'],
+        AuditResult.SUCCESS,
+      );
+      return result;
+    } catch (error) {
+      await this.recordProfileUpdate(
+        id,
+        ['profileImageUrl'],
+        AuditResult.FAILURE,
+      );
+      throw error;
     }
-
-    const user = (await this.repo.findById(id)) as AppUser | null;
-    if (!user) {
-      throw new AppException(ErrorCode.USER_NOT_FOUND, `User ${id} not found`);
-    }
-
-    const uploadedFile: StoredFile =
-      await this.fileStorageService.uploadFile(file);
-    return this.repo.update(id, {
-      profileImageUrl: uploadedFile.url,
-    }) as Promise<AppUser>;
   }
 
   /**

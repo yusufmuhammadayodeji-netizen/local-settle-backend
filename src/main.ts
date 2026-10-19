@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { randomUUID } from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
@@ -7,14 +8,42 @@ import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/errors';
 import { parseCookies } from './common/guards/csrf.guard';
+import {
+  JSON_BODY_LIMIT,
+  URLENCODED_BODY_LIMIT,
+} from './common/request-limits';
+import { requestSizeErrorHandler } from './common/request-size-error-handler';
+import { apiVersionMiddleware } from './common/api-version.middleware';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     rawBody: true,
+    bodyParser: false,
+  });
+
+  app.useBodyParser('json', { limit: JSON_BODY_LIMIT });
+  app.useBodyParser('urlencoded', {
+    extended: true,
+    limit: URLENCODED_BODY_LIMIT,
+    parameterLimit: 100,
   });
 
   app.use(helmet());
+  app.use(apiVersionMiddleware);
   app.useGlobalFilters(new HttpExceptionFilter());
+
+  app.use(
+    (req: Request & { correlationId?: string }, res: Response, next: NextFunction) => {
+      const incoming = req.header('x-correlation-id');
+      const correlationId =
+        incoming && incoming.length <= 64 && /^[A-Za-z0-9._-]+$/.test(incoming)
+          ? incoming
+          : randomUUID();
+      req.correlationId = correlationId;
+      res.setHeader('x-correlation-id', correlationId);
+      next();
+    },
+  );
 
   app.use(
     (
@@ -47,6 +76,7 @@ async function bootstrap() {
       'https://ikash.it.com',
     ],
     credentials: true,
+    exposedHeaders: ['X-API-Version', 'Deprecation', 'Sunset', 'Link'],
   });
 
   // Configure proxy trust for rate-limiting client IP extraction
@@ -61,6 +91,8 @@ async function bootstrap() {
 
   // 👇 CORRECCIÓN AQUÍ: Agrega '0.0.0.0' como segundo parámetro
   const port = process.env.PORT ?? 3001;
+  await app.init();
+  app.use(requestSizeErrorHandler);
   await app.listen(port, '0.0.0.0');
 
   console.log(`Application is running on port ${port}`);

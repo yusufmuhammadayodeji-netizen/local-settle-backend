@@ -10,6 +10,7 @@ describe('OfferRepository', () => {
     create: jest.fn().mockResolvedValue({ offerId: 'offer-1' }),
     findUnique: jest.fn().mockResolvedValue(null),
     findMany: jest.fn().mockResolvedValue([]),
+    updateMany: jest.fn().mockResolvedValue({ count: 1 }),
   };
   const paymentMethod = { findMany: jest.fn().mockResolvedValue([]) };
 
@@ -23,6 +24,7 @@ describe('OfferRepository', () => {
     offer.create.mockResolvedValue({ offerId: 'offer-1' });
     offer.findUnique.mockResolvedValue(null);
     offer.findMany.mockResolvedValue([]);
+    offer.updateMany.mockResolvedValue({ count: 1 });
     paymentMethod.findMany.mockResolvedValue([]);
   });
 
@@ -57,6 +59,29 @@ describe('OfferRepository', () => {
     });
   });
 
+  describe('optimistic updates', () => {
+    it('updates only the expected version and increments it atomically', async () => {
+      offer.updateMany.mockResolvedValue({ count: 1 });
+      offer.findUnique.mockResolvedValue({ offerId: 'offer-1', version: 4 });
+
+      await repo.updateWithVersion('offer-1', { price: '12.50' }, 3);
+
+      expect(offer.updateMany).toHaveBeenCalledWith({
+        where: { offerId: 'offer-1', version: 3 },
+        data: { price: '12.50', version: { increment: 1 } },
+      });
+    });
+
+    it('rejects stale versions with a conflict', async () => {
+      offer.updateMany.mockResolvedValue({ count: 0 });
+      offer.findUnique.mockResolvedValue({ offerId: 'offer-1' });
+
+      await expect(
+        repo.updateWithVersion('offer-1', { price: '12.50' }, 2),
+      ).rejects.toThrow('Offer has changed. Reload it and retry with the current version.');
+    });
+  });
+
   it('creates without a payment-method pre-check when none are requested', async () => {
     await repo.create({ creatorId: 'user-1', type: 'sell' });
 
@@ -73,7 +98,11 @@ describe('OfferRepository', () => {
     await repo.create({ creatorId: 'user-1', paymentMethodIds: ['pm-1'] });
 
     expect(paymentMethod.findMany).toHaveBeenCalledWith({
-      where: { paymentId: { in: ['pm-1'] } },
+      where: {
+        paymentId: { in: ['pm-1'] },
+        userId: 'user-1',
+        isActive: true,
+      },
       select: { paymentId: true },
     });
     expect(offer.create).toHaveBeenCalledWith({
@@ -83,5 +112,17 @@ describe('OfferRepository', () => {
       },
       include: OFFER_DETAIL_INCLUDE,
     });
+  });
+
+  it('rejects a mixed set before creating the offer', async () => {
+    paymentMethod.findMany.mockResolvedValue([{ paymentId: 'pm-1' }]);
+
+    await expect(
+      repo.create({
+        creatorId: 'user-1',
+        paymentMethodIds: ['pm-1', 'pm-foreign'],
+      }),
+    ).rejects.toThrow('Payment methods must be active and owned by the offer creator');
+    expect(offer.create).not.toHaveBeenCalled();
   });
 });

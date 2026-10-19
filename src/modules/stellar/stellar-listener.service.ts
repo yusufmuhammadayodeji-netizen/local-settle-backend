@@ -10,6 +10,7 @@ import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
 import { EscrowService } from '../escrow/escrow.service';
 import { OrderService } from '../order/order.service';
+import { TrustlessWorkService } from '../escrow/trustless-work.service';
 import { StellarEventParserService } from './stellar-event-parser.service';
 import {
   OnChainEscrowEvent,
@@ -23,6 +24,12 @@ import {
 } from '@prisma/client';
 import axios from 'axios';
 
+const SUPPORTED_ESCROW_TOPICS = [
+  'ESCROW_CREATED', 'ESCROW_FUNDED', 'ESCROW_RELEASED',
+  'ESCROW_REFUNDED', 'ESCROW_CANCELLED', 'ESCROW_DISPUTED',
+];
+const ROLLBACK_REPLAY_WINDOW = 64;
+
 type EscrowWithOrder = EscrowOnChain & {
   order?: Order | null;
 };
@@ -32,6 +39,7 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(StellarListenerService.name);
   private isListening = false;
   private timer: NodeJS.Timeout | null = null;
+  private activePoll: Promise<void> | null = null;
 
   private lastProcessedLedger = 0;
   private readonly processedEventIds = new Set<string>();
@@ -48,6 +56,7 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
     private readonly parser: StellarEventParserService,
     private readonly escrowService: EscrowService,
     private readonly orderService: OrderService,
+    private readonly trustlessWork: TrustlessWorkService,
   ) {
     this.rpcUrl =
       this.config.get<string>('STELLAR_RPC_URL') ??
@@ -69,8 +78,9 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
     this.startListening();
   }
 
-  onModuleDestroy() {
+  async onModuleDestroy(): Promise<void> {
     this.stopListening();
+    await this.activePoll;
   }
 
   /**
@@ -101,8 +111,20 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
   private scheduleNextPoll(delayMs: number) {
     if (!this.isListening) return;
     this.timer = setTimeout(() => {
-      void this.pollEventsWithRecovery();
+      this.activePoll = this.pollEventsWithRecovery().finally(() => {
+        this.activePoll = null;
+      });
     }, delayMs);
+  }
+
+  private emitMetric(
+    name: string,
+    value: number,
+    labels: Record<string, string> = {},
+  ) {
+    // Labels are fixed enums only; never include contract, order, wallet, or
+    // transaction identifiers in operational metrics.
+    this.logger.log(JSON.stringify({ metric: name, value, labels }));
   }
 
   /**
@@ -133,9 +155,37 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
       return 0;
     }
 
-    const { events: rawEvents, latestLedger } =
+    let { events: rawEvents, latestLedger } =
       await this.queryEventsFromRpc(targetContracts);
+
+    if (
+      latestLedger !== undefined &&
+      this.lastProcessedLedger > latestLedger
+    ) {
+      const previousCheckpoint = this.lastProcessedLedger;
+      const replayFrom = Math.max(0, latestLedger - ROLLBACK_REPLAY_WINDOW);
+      this.logger.warn(
+        `Soroban checkpoint regressed from ${previousCheckpoint} to ${latestLedger}; replaying events from ledger ${replayFrom}.`,
+      );
+      this.emitMetric('stellar.listener.checkpoint_regression.total', 1, {
+        result: 'detected',
+      });
+
+      this.processedEventIds.clear();
+      this.lastProcessedLedger = replayFrom;
+      await this.reconcileTerminalEscrowsFromChain(targetContracts);
+      ({ events: rawEvents, latestLedger } =
+        await this.queryEventsFromRpc(targetContracts));
+    }
+
+    if (latestLedger !== undefined) {
+      this.emitMetric(
+        'stellar.listener.poll_lag_ledgers',
+        Math.max(0, latestLedger - this.lastProcessedLedger),
+      );
+    }
     let processedCount = 0;
+    let failedEvent = false;
 
     for (const raw of rawEvents) {
       try {
@@ -150,6 +200,10 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
           parsed.ledgerSequence &&
           parsed.ledgerSequence > this.lastProcessedLedger
         ) {
+          // Handled events checkpoint inside the same transaction as their
+          // escrow/order/audit updates. Skipped but valid events can advance
+          // the cursor here because they require no database mutation.
+          if (!handled) await this.persistCheckpoint(parsed.ledgerSequence);
           this.lastProcessedLedger = parsed.ledgerSequence;
         }
       } catch (err: unknown) {
@@ -159,10 +213,20 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
           `Failed to process individual Stellar event ${raw.id}: ${message}`,
           stack,
         );
+        // Do not move the durable cursor beyond a failed event. The next poll
+        // must fetch it again before it can safely process later ledgers.
+        failedEvent = true;
+        break;
       }
     }
 
-    if (latestLedger && latestLedger > this.lastProcessedLedger) {
+    if (
+      latestLedger &&
+      latestLedger > this.lastProcessedLedger &&
+      rawEvents.length === 0 &&
+      !failedEvent
+    ) {
+      await this.persistCheckpoint(latestLedger);
       this.lastProcessedLedger = latestLedger;
     }
 
@@ -202,11 +266,86 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * A rollback can invalidate an event that previously made an escrow
+   * terminal. Ask the indexer to validate each terminal contract against
+   * chain state before replaying, then move only records with an explicit,
+   * usable on-chain snapshot back to the canonical status.
+   */
+  private async reconcileTerminalEscrowsFromChain(
+    contractIds: string[],
+  ): Promise<void> {
+    const terminalEscrows = await this.prisma.escrowOnChain.findMany({
+      where: {
+        contractId: { in: contractIds },
+        escrowStatus: { in: ['released', 'resolved', 'disputed'] },
+      },
+      include: { order: true },
+    });
+
+    for (const escrow of terminalEscrows) {
+      if (!escrow.contractId) continue;
+      try {
+        const [snapshot] = await this.trustlessWork.getEscrowByContractId(
+          escrow.contractId,
+          true,
+        );
+        if (!snapshot) continue;
+
+        let escrowStatus: escrow_status | undefined;
+        let orderStatus: order_status | undefined;
+        if (snapshot.flags?.resolved === true) {
+          escrowStatus = 'resolved';
+          orderStatus = 'cancelled';
+        } else if (snapshot.flags?.released === true) {
+          escrowStatus = 'released';
+          orderStatus = 'released';
+        } else if (snapshot.flags?.disputed === true) {
+          escrowStatus = 'disputed';
+          orderStatus = 'disputed';
+        } else if (
+          snapshot.isActive === true &&
+          typeof snapshot.balance === 'number'
+        ) {
+          escrowStatus = snapshot.balance > 0 ? 'funded' : 'initialized';
+          orderStatus = snapshot.balance > 0 ? 'locked' : 'created';
+        }
+
+        // Missing or ambiguous indexer fields are not grounds for changing
+        // local state. Only apply a complete, explicit canonical snapshot.
+        if (!escrowStatus || !orderStatus) continue;
+
+        await this.prisma.$transaction(async (tx) => {
+          await tx.escrowOnChain.update({
+            where: { escrowId: escrow.escrowId },
+            data: {
+              escrowStatus,
+              ...(escrowStatus === 'initialized' || escrowStatus === 'funded'
+                ? { txHashRelease: null }
+                : {}),
+              ...(escrowStatus === 'initialized' ? { txHashLock: null } : {}),
+            },
+          });
+          await tx.order.update({
+            where: { orderId: escrow.orderId },
+            data: { orderStatus },
+          });
+        });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.warn(
+          `Could not reconcile escrow ${escrow.escrowId} after ledger rollback: ${message}`,
+        );
+      }
+    }
+  }
+
+  /**
    * Issues RPC POST request to Soroban getEvents endpoint.
    */
   private async queryEventsFromRpc(
     contractIds: string[],
   ): Promise<{ events: SorobanEventRaw[]; latestLedger?: number }> {
+    const startedAt = Date.now();
     try {
       const body = {
         jsonrpc: '2.0',
@@ -219,6 +358,7 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
             {
               type: 'contract',
               contractIds,
+              topics: [SUPPORTED_ESCROW_TOPICS.map((value) => ({ type: 'symbol', value }))],
             },
           ],
           pagination: {
@@ -231,10 +371,14 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
         error?: unknown;
         result?: { events?: SorobanEventRaw[]; latestLedger?: number };
       }>(this.rpcUrl, body, { timeout: 10000 });
-
       if (res.data.error) {
         throw new Error(`Soroban RPC error: ${JSON.stringify(res.data.error)}`);
       }
+
+      this.emitMetric('stellar.rpc.request.duration_ms', Date.now() - startedAt, {
+        provider: 'soroban',
+        result: 'success',
+      });
 
       const events: SorobanEventRaw[] = res.data.result?.events || [];
       const latestLedger = res.data.result?.latestLedger
@@ -243,6 +387,10 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
 
       return { events, latestLedger };
     } catch (err: unknown) {
+      this.emitMetric('stellar.rpc.request.duration_ms', Date.now() - startedAt, {
+        provider: 'soroban',
+        result: 'error',
+      });
       const message = err instanceof Error ? err.message : String(err);
       this.logger.debug(
         `RPC call getEvents failed/fallback to Horizon: ${message}`,
@@ -330,6 +478,16 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
           },
         },
       });
+
+      if (event.ledgerSequence) {
+        await tx.$executeRaw`
+          INSERT INTO stellar_listener_checkpoint (id, ledger_sequence, updated_at)
+          VALUES (1, ${BigInt(event.ledgerSequence)}, NOW())
+          ON CONFLICT (id) DO UPDATE
+          SET ledger_sequence = EXCLUDED.ledger_sequence, updated_at = NOW()
+          WHERE stellar_listener_checkpoint.ledger_sequence < EXCLUDED.ledger_sequence
+        `;
+      }
     });
 
     this.notifyUsers(
@@ -340,6 +498,10 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
     );
 
     this.processedEventIds.add(eventKey);
+    this.emitMetric('escrow.transition.total', 1, {
+      event: event.eventType,
+      result: 'success',
+    });
     this.logger.log(
       `Successfully synchronized event ${event.eventType} for Escrow ${escrow.escrowId} (Order ${escrow.orderId})`,
     );
@@ -444,6 +606,20 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
 
   private async loadLastProcessedLedger() {
     try {
+      const checkpoints = await this.prisma.$queryRaw<
+        Array<{ ledger_sequence: bigint | number | string }>
+      >`SELECT ledger_sequence FROM stellar_listener_checkpoint WHERE id = 1`;
+      const checkpointLedger = checkpoints[0]?.ledger_sequence;
+      if (checkpointLedger !== undefined) {
+        this.lastProcessedLedger = Number(checkpointLedger);
+        this.logger.log(
+          `Resuming event sync from saved ledger sequence: ${this.lastProcessedLedger}`,
+        );
+        return;
+      }
+
+      // One-time compatibility fallback for databases upgraded before the
+      // independent checkpoint table existed.
       const latestAudit = await this.prisma.auditLog.findFirst({
         where: {
           action: {
@@ -476,5 +652,15 @@ export class StellarListenerService implements OnModuleInit, OnModuleDestroy {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.warn(`Could not load last processed ledger: ${message}`);
     }
+  }
+
+  private async persistCheckpoint(ledgerSequence: number): Promise<void> {
+    await this.prisma.$executeRaw`
+      INSERT INTO stellar_listener_checkpoint (id, ledger_sequence, updated_at)
+      VALUES (1, ${BigInt(ledgerSequence)}, NOW())
+      ON CONFLICT (id) DO UPDATE
+      SET ledger_sequence = EXCLUDED.ledger_sequence, updated_at = NOW()
+      WHERE stellar_listener_checkpoint.ledger_sequence < EXCLUDED.ledger_sequence
+    `;
   }
 }

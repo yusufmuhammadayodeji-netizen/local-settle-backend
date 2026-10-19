@@ -10,6 +10,7 @@ import {
 import { StellarService } from './stellar.service';
 import { SendPaymentDto } from './dto/send-payment';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { SetupCompleteGuard } from '../auth/setup-complete.guard';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 
 @Controller('stellar')
@@ -31,15 +32,17 @@ export class StellarController {
    * The public key is resolved from the JWT token.
    * @param limit - Number of transactions to return (default: 10, max: 200)
    */
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, SetupCompleteGuard)
   @Get('transactions')
   getMyTransactions(
     @CurrentUser() user: { publicKey: string },
     @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
   ) {
     return this.stellar.getTransactions(
       user.publicKey,
       limit ? Number(limit) : 10,
+      cursor,
     );
   }
 
@@ -47,8 +50,13 @@ export class StellarController {
   getTxs(
     @Param('publicKey') publicKey: string,
     @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
   ) {
-    return this.stellar.getTransactions(publicKey, limit ? Number(limit) : 10);
+    return this.stellar.getTransactions(
+      publicKey,
+      limit ? Number(limit) : 10,
+      cursor,
+    );
   }
 
   @Post('pay')

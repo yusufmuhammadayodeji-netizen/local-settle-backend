@@ -112,3 +112,147 @@ describe('OrderService.cancel', () => {
     },
   );
 });
+
+describe('OrderService.update status transitions', () => {
+  let service: OrderService;
+  const repo = {
+    findById: jest.fn(),
+    update: jest.fn(),
+    updateIfStatusesMatch: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        OrderService,
+        { provide: OrderRepository, useValue: repo },
+        { provide: EscrowService, useValue: {} },
+        { provide: AuditLogService, useValue: { create: jest.fn() } },
+        { provide: PrismaService, useValue: {} },
+      ],
+    }).compile();
+    service = module.get(OrderService);
+  });
+
+  it('allows created to locked only after the escrow is funded', async () => {
+    repo.findById.mockResolvedValue({ orderStatus: 'created', escrow: { escrowStatus: 'funded' } });
+    repo.updateIfStatusesMatch.mockResolvedValue(true);
+
+    await service.update('order-1', { orderStatus: 'locked' });
+
+    expect(repo.updateIfStatusesMatch).toHaveBeenCalledWith(
+      'order-1',
+      'created',
+      'funded',
+      { orderStatus: 'locked' },
+    );
+  });
+
+  it.each(['cancelled', 'expired', 'released', 'disputed'])(
+    'rejects generic created -> %s transition with stable conflict code',
+    async (orderStatus) => {
+      repo.findById.mockResolvedValue({ orderStatus: 'created', escrow: null });
+
+      await expect(service.update('order-1', { orderStatus: orderStatus as never }))
+        .rejects.toMatchObject({
+          status: 409,
+          response: expect.objectContaining({ error: 'ORDER_INVALID_TRANSITION' }),
+        });
+      expect(repo.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it('cannot reopen a terminal order through generic PATCH', async () => {
+    repo.findById.mockResolvedValue({ orderStatus: 'released', escrow: { escrowStatus: 'released' } });
+
+    await expect(service.update('order-1', { orderStatus: 'created' }))
+      .rejects.toMatchObject({
+        status: 409,
+        response: expect.objectContaining({ error: 'ORDER_INVALID_TRANSITION' }),
+      });
+    expect(repo.update).not.toHaveBeenCalled();
+  });
+
+  it('requires a released escrow before releasing a locked order', async () => {
+    repo.findById.mockResolvedValue({ orderStatus: 'locked', escrow: { escrowStatus: 'funded' } });
+
+    await expect(service.update('order-1', { orderStatus: 'released' }))
+      .rejects.toMatchObject({
+        status: 409,
+        response: expect.objectContaining({ error: 'ORDER_INVALID_TRANSITION' }),
+      });
+    expect(repo.update).not.toHaveBeenCalled();
+  });
+
+  it('returns a stable conflict when status changes after validation', async () => {
+    repo.findById.mockResolvedValue({
+      orderStatus: 'created',
+      escrow: { escrowStatus: 'funded' },
+    });
+    repo.updateIfStatusesMatch.mockResolvedValue(false);
+
+    await expect(service.update('order-1', { orderStatus: 'locked' })).rejects
+      .toMatchObject({
+        status: 409,
+        response: expect.objectContaining({ error: 'ORDER_INVALID_TRANSITION' }),
+      });
+    expect(repo.updateIfStatusesMatch).toHaveBeenCalledWith(
+      'order-1',
+      'created',
+      'funded',
+      { orderStatus: 'locked' },
+    );
+  });
+});
+
+describe('OrderService.getUserStats access policy', () => {
+  let service: OrderService;
+  const repo = { getUserStats: jest.fn() };
+  const prisma = { appUser: { findUnique: jest.fn() } };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        OrderService,
+        { provide: OrderRepository, useValue: repo },
+        { provide: EscrowService, useValue: {} },
+        { provide: AuditLogService, useValue: { create: jest.fn() } },
+        { provide: PrismaService, useValue: prisma },
+      ],
+    }).compile();
+    service = module.get(OrderService);
+    repo.getUserStats.mockResolvedValue({ totalOrders: 3, completedOrders: 1 });
+  });
+
+  it('allows an authenticated user to read only their own counters', async () => {
+    await expect(service.getUserStats('owner-1', 'owner-1')).resolves.toEqual({
+      totalOrders: 3,
+      completedOrders: 1,
+    });
+    expect(prisma.appUser.findUnique).not.toHaveBeenCalled();
+    expect(repo.getUserStats).toHaveBeenCalledWith('owner-1');
+  });
+
+  it('allows an administrator to read another account counters', async () => {
+    prisma.appUser.findUnique.mockResolvedValue({ role: 'admin' });
+
+    await expect(service.getUserStats('target-1', 'admin-1')).resolves.toEqual({
+      totalOrders: 3,
+      completedOrders: 1,
+    });
+    expect(repo.getUserStats).toHaveBeenCalledWith('target-1');
+  });
+
+  it('denies a non-admin reading another account counters', async () => {
+    prisma.appUser.findUnique.mockResolvedValue({ role: 'user' });
+
+    await expect(service.getUserStats('target-1', 'user-1'))
+      .rejects.toMatchObject({
+        status: 403,
+        response: expect.objectContaining({ error: 'UNAUTHORIZED_ACTION' }),
+      });
+    expect(repo.getUserStats).not.toHaveBeenCalled();
+  });
+});

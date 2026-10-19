@@ -2,6 +2,8 @@ export const ChatEvent = {
   JOIN_ORDER: 'join-order',
   LEAVE_ORDER: 'leave-order',
   SEND_MESSAGE: 'send-message',
+  MARK_READ: 'mark-read',
+  MESSAGE_RECEIPT: 'message-receipt',
   MESSAGE_CREATED: 'message-created',
   CHAT_ERROR: 'chat-error',
   USER_JOINED: 'user-joined',
@@ -13,6 +15,7 @@ export const ChatErrorCode = {
   INVALID_ORDER_ID: 'INVALID_ORDER_ID',
   UNAUTHORIZED_ORDER_ACCESS: 'UNAUTHORIZED_ORDER_ACCESS',
   EMPTY_MESSAGE: 'EMPTY_MESSAGE',
+  INVALID_MESSAGE_CONTENT: 'INVALID_MESSAGE_CONTENT',
   NOT_IN_ORDER_ROOM: 'NOT_IN_ORDER_ROOM',
   MESSAGE_PERSISTENCE_FAILED: 'MESSAGE_PERSISTENCE_FAILED',
 } as const;

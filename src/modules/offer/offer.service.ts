@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PaginationDto } from '../../common/pagination.dto';
 import { CreateOfferDto } from './dto/create-offer.dto';
 import { UpdateOfferDto } from './dto/update-offer.dto';
@@ -14,6 +14,12 @@ export type OfferFilter = {
   status?: offer_status;
   type?: offer_type;
   assetCode?: string;
+  minPrice?: string;
+  maxPrice?: string;
+  minAmount?: string;
+  maxAmount?: string;
+  sortBy?: 'price' | 'createdAt' | 'offerId';
+  sortOrder?: 'asc' | 'desc';
 };
 
 @Injectable()
@@ -40,13 +46,37 @@ export class OfferService {
     return created;
   }
 
-  list(p: PaginationDto, q: OfferFilter): Promise<OfferWithRelations[]> {
+  list(p: PaginationDto, q: OfferFilter) {
     const where: Record<string, unknown> = {};
     if (q.creatorId) where.creatorId = q.creatorId;
     if (q.status) where.status = q.status;
+    if (q.status === 'active' && !q.creatorId) where.executed = false;
     if (q.type) where.type = q.type;
     if (q.assetCode) where.assetCode = q.assetCode;
-    return this.repo.search(where, p.skip, p.take);
+    if (q.minPrice !== undefined || q.maxPrice !== undefined) {
+      where.price = {
+        ...(q.minPrice !== undefined ? { gte: q.minPrice } : {}),
+        ...(q.maxPrice !== undefined ? { lte: q.maxPrice } : {}),
+      };
+    }
+    if (q.minAmount !== undefined || q.maxAmount !== undefined) {
+      where.AND = [
+        ...(q.minAmount !== undefined ? [{ maxAmount: { gte: q.minAmount } }] : []),
+        ...(q.maxAmount !== undefined ? [{ minAmount: { lte: q.maxAmount } }] : []),
+      ];
+    }
+    const sortBy = q.sortBy === 'price' || q.sortBy === 'createdAt' ? q.sortBy : 'offerId';
+    const sortOrder = q.sortOrder === 'asc' ? 'asc' : 'desc';
+    return this.repo.searchPage(
+      where,
+      p.skip ?? 0,
+      p.take ?? 20,
+      sortBy,
+      sortOrder,
+    ).then((page) => ({
+      ...page,
+      items: page.items.map((offer) => this.maskPaymentMethods(offer)),
+    }));
   }
 
   async get(id: string): Promise<OfferWithRelations> {
@@ -57,13 +87,50 @@ export class OfferService {
         `Offer ${id} not found`,
       );
     }
-    return item;
+    return this.maskPaymentMethods(item);
   }
 
-  async update(id: string, dto: UpdateOfferDto): Promise<Offer> {
-    const updated = (await this.repo.update(
+  /** Offer discovery is public; never serialize payment account details here. */
+  private maskPaymentMethods(offer: OfferWithRelations): OfferWithRelations {
+    return {
+      ...offer,
+      payment_methods: offer.payment_methods.map((method) => ({
+        ...method,
+        accountIdentifier: this.maskIdentifier(method.accountIdentifier),
+        beneficiaryName: null,
+      })),
+    };
+  }
+
+  private maskIdentifier(value: string): string {
+    const visibleSuffix = value.slice(-4);
+    return `${'*'.repeat(Math.max(4, value.length - visibleSuffix.length))}${visibleSuffix}`;
+  }
+
+  async update(
+    id: string,
+    dto: UpdateOfferDto,
+    actorId: string,
+  ): Promise<Offer> {
+    const current = await this.repo.findById(id);
+    if (!current) {
+      throw new AppException(ErrorCode.OFFER_NOT_FOUND, `Offer ${id} not found`);
+    }
+    if (
+      current.creatorId !== actorId &&
+      (await this.repo.getUserRole(actorId)) !== 'admin'
+    ) {
+      throw new ForbiddenException('Only the offer creator or an admin can update it');
+    }
+    const { expectedVersion, ...changes } = dto;
+    const updated = (await this.repo.updateWithVersion(
       id,
-      dto as unknown as Record<string, unknown>,
+      changes as Record<string, unknown>,
+      expectedVersion,
+    )) as Offer;
+      id,
+      changes as Record<string, unknown>,
+      expectedVersion,
     )) as Offer;
 
     await this.auditLogService.create({
@@ -77,7 +144,12 @@ export class OfferService {
     return updated;
   }
 
-  async remove(id: string): Promise<Offer> {
+  async remove(id: string, actorId: string): Promise<Offer> {
+    const current = await this.repo.findById(id);
+    if (!current) throw new NotFoundException('Offer not found');
+    if (current.creatorId !== actorId && (await this.repo.getUserRole(actorId)) !== 'admin') {
+      throw new ForbiddenException('Only the offer creator or an admin can delete it');
+    }
     const removed = (await this.repo.delete(id)) as Offer;
 
     await this.auditLogService.create({

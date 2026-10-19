@@ -10,10 +10,12 @@ describe('AuthController', () => {
 
   const createChallengeMock = jest.fn();
   const loginMock = jest.fn();
+  const revokeSessionMock = jest.fn();
 
   const mockAuthService = {
     createChallenge: createChallengeMock,
     login: loginMock,
+    revokeSession: revokeSessionMock,
   };
 
   const mockAuthRateLimitGuard = {
@@ -146,9 +148,16 @@ describe('AuthController', () => {
         expiresAt: '2026-08-25T12:00:00.000Z',
       });
 
-      const result = await controller.createChallenge(dto);
+      const mockReq = {
+        ip: '127.0.0.1',
+        headers: { 'user-agent': 'unit-test' },
+      } as unknown as Request;
+      const result = await controller.createChallenge(dto, mockReq);
 
-      expect(createChallengeMock).toHaveBeenCalledWith(dto);
+      expect(createChallengeMock).toHaveBeenCalledWith(dto, {
+        ipAddress: '127.0.0.1',
+        userAgent: 'unit-test',
+      });
       expect(result).toEqual({
         challenge: 'challenge-string',
         expiresAt: '2026-08-25T12:00:00.000Z',
@@ -182,6 +191,22 @@ describe('AuthController', () => {
         token: 'jwt-token',
         user: { id: 'user-id', address: dto.publicKey },
       });
+    });
+  });
+
+  describe('logout', () => {
+    it('revokes only the session on the authenticated request', async () => {
+      const request = {
+        user: { userId: 'user-1', sessionId: 'session-1' },
+      } as unknown as Request & {
+        user: { userId: string; sessionId: string };
+      };
+      revokeSessionMock.mockResolvedValue({ revoked: true });
+
+      await expect(controller.logout(request)).resolves.toEqual({
+        revoked: true,
+      });
+      expect(revokeSessionMock).toHaveBeenCalledWith('user-1', 'session-1');
     });
   });
 });

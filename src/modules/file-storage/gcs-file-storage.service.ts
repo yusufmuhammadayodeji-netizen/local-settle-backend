@@ -60,6 +60,15 @@ export class GcsFileStorageService
     }
   }
 
+  async deleteFile(storedUrl: string): Promise<void> {
+    const prefix = `${this.publicUrlBase}/`;
+    if (!storedUrl.startsWith(prefix)) {
+      throw new Error('Stored evidence URL is outside the configured bucket');
+    }
+    const key = decodeURIComponent(storedUrl.slice(prefix.length));
+    await this.bucket.file(key).delete({ ignoreNotFound: true });
+  }
+
   async uploadFile(file: UploadFileInput): Promise<StoredFile> {
     const key =
       file.key ??
@@ -86,4 +95,23 @@ export class GcsFileStorageService
       url: `${this.publicUrlBase}/${key}`,
     };
   }
+
+  async getSignedDownloadUrl(
+    storedUrl: string,
+    expiresInSeconds: number,
+  ): Promise<string> {
+    const prefix = `${this.publicUrlBase}/`;
+    if (!storedUrl.startsWith(prefix)) {
+      throw new Error('Stored evidence URL is outside the configured bucket');
+    }
+    const key = decodeURIComponent(storedUrl.slice(prefix.length));
+    if (!key.startsWith('evidence/')) throw new Error('Only evidence objects can be signed for download');
+    const [url] = await this.bucket.file(key).getSignedUrl({
+      version: 'v4',
+      action: 'read',
+      expires: Date.now() + expiresInSeconds * 1000,
+    });
+    return url;
+  }
+
 }

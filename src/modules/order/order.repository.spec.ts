@@ -1,5 +1,10 @@
-import { OrderRepository, ORDER_DETAIL_INCLUDE } from './order.repository';
+import {
+  OrderRepository,
+  ORDER_DETAIL_INCLUDE,
+  calculateFiatAmount,
+} from './order.repository';
 import { PrismaService } from '../../../prisma/prisma.service';
+import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
 import {
   ORDER_PARTY_SELECT,
   PAYMENT_METHOD_SELECT,
@@ -7,20 +12,92 @@ import {
 } from '../../common/prisma-selects';
 
 describe('OrderRepository', () => {
+  describe('fiat total calculation', () => {
+    it('uses decimal arithmetic for repeating fractional amounts', () => {
+      expect(calculateFiatAmount('1.3333333', '3')).toBe('4.00');
+    });
+
+    it('rounds half up to two fiat decimal places', () => {
+      expect(calculateFiatAmount('0.5', '0.01')).toBe('0.01');
+    });
+  });
+
   const order = {
     findMany: jest.fn().mockResolvedValue([]),
     findUnique: jest.fn().mockResolvedValue(null),
     groupBy: jest.fn().mockResolvedValue([]),
     count: jest.fn().mockResolvedValue(0),
+    updateMany: jest.fn().mockResolvedValue({ count: 1 }),
   };
 
   const repo = new OrderRepository({ order } as unknown as PrismaService);
+
+  describe('atomic order audit', () => {
+    it('writes order and audit through the same transaction callback', async () => {
+      const tx = {
+        order: { create: jest.fn().mockResolvedValue({ orderId: 'order-1' }) },
+        offer: {
+          findUnique: jest.fn().mockResolvedValue({ price: '2.00' }),
+          update: jest.fn().mockResolvedValue({}),
+        },
+        escrowOnChain: { create: jest.fn() },
+        auditLog: { create: jest.fn().mockResolvedValue({ id: 'audit-1' }) },
+      };
+      const prisma = {
+        $transaction: jest.fn((callback: (client: typeof tx) => unknown) =>
+          callback(tx),
+        ),
+      };
+      const transactionalRepo = new OrderRepository(
+        prisma as unknown as PrismaService,
+      );
+
+      const input = {
+        offerId: 'offer-1',
+        buyerId: 'buyer-1',
+        sellerId: 'seller-1',
+        assetAmount: '1',
+        fiatAmount: '2.00',
+        escrow: {
+          contractId: 'contract-1',
+          sellerAddress: 'seller-address',
+          buyerAddress: 'buyer-address',
+          amount: '1',
+        },
+        auditLog: {
+          userId: 'buyer-1',
+          action: AuditAction.ORDER_CREATED,
+          resourceType: 'Order',
+          resourceId: 'order-1',
+          result: AuditResult.SUCCESS,
+        },
+      };
+      await transactionalRepo.create(input);
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(tx.order.create).toHaveBeenCalledTimes(1);
+      expect(tx.auditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          action: AuditAction.ORDER_CREATED,
+          resourceId: 'order-1',
+        }),
+      });
+
+      tx.auditLog.create.mockRejectedValueOnce(
+        new Error('audit database unavailable'),
+      );
+      await expect(transactionalRepo.create(input)).rejects.toThrow(
+        'audit database unavailable',
+      );
+    });
+  });
 
   beforeEach(() => {
     jest.clearAllMocks();
     order.findMany.mockResolvedValue([]);
     order.findUnique.mockResolvedValue(null);
     order.groupBy.mockResolvedValue([]);
+    order.updateMany.mockResolvedValue({ count: 1 });
   });
 
   describe('relation projections', () => {
@@ -116,6 +193,33 @@ describe('OrderRepository', () => {
         totalOrders: 0,
         completedOrders: 0,
       });
+    });
+  });
+
+  describe('updateIfStatusesMatch', () => {
+    it('conditions the write on both observed order and escrow statuses', async () => {
+      await repo.updateIfStatusesMatch('order-1', 'created', 'funded', {
+        orderStatus: 'locked',
+      });
+
+      expect(order.updateMany).toHaveBeenCalledWith({
+        where: {
+          orderId: 'order-1',
+          orderStatus: 'created',
+          escrow: { is: { escrowStatus: 'funded' } },
+        },
+        data: { orderStatus: 'locked' },
+      });
+    });
+
+    it('returns false when another transition already changed the state', async () => {
+      order.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        repo.updateIfStatusesMatch('order-1', 'created', 'funded', {
+          orderStatus: 'locked',
+        }),
+      ).resolves.toBe(false);
     });
   });
 });

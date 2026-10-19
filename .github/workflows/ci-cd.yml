@@ -22,20 +22,40 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check required environment variable documentation
+        run: node scripts/check-env-docs.js
+
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          version: 11.13.0
 
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version-file: .nvmrc
           cache: pnpm
 
-      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm install --frozen-lockfile
+
+      - name: Validate Prisma schema without a database
+        run: pnpm exec prisma validate
+        env:
+          DATABASE_URL: postgresql://user:password@localhost:5432/local_settle_ci
+          DIRECT_URL: postgresql://user:password@localhost:5432/local_settle_ci
 
       - run: pnpm run lint
 
       - run: pnpm run test
+
+      - name: Generate OpenAPI contract
+        run: pnpm run openapi:generate
+
+      - name: Publish OpenAPI contract artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-settle-openapi-${{ github.sha }}
+          path: contracts/openapi.json
+          if-no-files-found: error
+          retention-days: 30
 
   deploy:
     name: Build & Deploy to Cloud Run
@@ -67,14 +87,14 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          version: 11.13.0
 
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version-file: .nvmrc
           cache: pnpm
 
-      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm install --frozen-lockfile
 
       - name: Authenticate Docker with Artifact Registry
         run: gcloud auth configure-docker ${{ env.REGISTRY_URL }} --quiet
